@@ -89,6 +89,35 @@ async function handleOnboarding(userId: string, replyToken: string, text: string
   await replyMessage(replyToken, STEP_QUESTIONS[nextStep])
 }
 
+async function handleMealLog(userId: string, replyToken: string, foodName: string, quantityG: number) {
+  const user = await prisma.user.upsert({
+    where: { lineUserId: userId },
+    update: {},
+    create: { lineUserId: userId },
+  })
+
+  const food = await searchFood(foodName)
+  if (!food) {
+    await replyMessage(replyToken, { type: 'text', text: `ไม่พบข้อมูลโภชนาการของ "${foodName}"` })
+    return
+  }
+
+  const { scaledNutrients } = await import('@/lib/meal/scaledNutrients')
+  const nutrients = scaledNutrients(food.nutrients, quantityG)
+
+  await prisma.mealLog.create({
+    data: {
+      userId: user.id,
+      foodName: food.name,
+      quantityG,
+      ...nutrients,
+    },
+  })
+
+  const text = `✅ บันทึกแล้ว!\n\n🍽️ ${food.name} (${quantityG}g)\n• แคลอรี่: ${nutrients.calories} kcal\n• โปรตีน: ${nutrients.protein}g\n• คาร์บ: ${nutrients.carbs}g\n• ไขมัน: ${nutrients.fat}g`
+  await replyMessage(replyToken, { type: 'text', text })
+}
+
 async function handleImageMessage(messageId: string, replyToken: string) {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? ''
   const res = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
@@ -146,7 +175,15 @@ export async function POST(req: NextRequest) {
     } else if (event.type === 'message' && event.message.type === 'image') {
       await handleImageMessage(event.message.id, event.replyToken)
     } else if (event.type === 'message' && event.message.type === 'text') {
-      await handleOnboarding(event.source.userId, event.replyToken, event.message.text)
+      const text: string = event.message.text
+      if (text.startsWith('log:')) {
+        const [, foodName, qty] = text.split(':')
+        await handleMealLog(event.source.userId, event.replyToken, foodName, parseInt(qty))
+      } else if (text === 'ยกเลิก') {
+        await replyMessage(event.replyToken, { type: 'text', text: 'ยกเลิกแล้ว 👍 ส่งรูปอาหารหรือพิมพ์ชื่ออาหารใหม่ได้เลย' })
+      } else {
+        await handleOnboarding(event.source.userId, event.replyToken, text)
+      }
     }
   }
 

@@ -155,6 +155,107 @@ async function handleDailySummary(userId: string, replyToken: string) {
   await replyMessage(replyToken, { type: 'text', text })
 }
 
+async function handleDeleteList(userId: string, replyToken: string) {
+  const user = await prisma.user.upsert({ where: { lineUserId: userId }, update: {}, create: { lineUserId: userId } })
+  const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0)
+  const logs = await prisma.mealLog.findMany({ where: { userId: user.id, loggedAt: { gte: startOfDay } } })
+
+  if (logs.length === 0) {
+    await replyMessage(replyToken, { type: 'text', text: 'ยังไม่มีมื้ออาหารวันนี้ที่จะลบ' })
+    return
+  }
+
+  const items = logs.map((l: { id: string; foodName: string; quantityG: number }) => ({
+    type: 'action', action: { type: 'message', label: `${l.foodName} ${l.quantityG}g`, text: `delete:${l.id}` },
+  }))
+  items.push({ type: 'action', action: { type: 'message', label: 'ยกเลิก', text: 'ยกเลิก' } })
+
+  const text = `มื้ออาหารวันนี้:\n${logs.map((l: { foodName: string; quantityG: number; calories: number }) => `• ${l.foodName} ${l.quantityG}g (${l.calories} kcal)`).join('\n')}\n\nเลือกรายการที่ต้องการลบ:`
+  await replyMessage(replyToken, { type: 'text', text, quickReply: { items } })
+}
+
+async function handleDeleteConfirm(userId: string, replyToken: string, logId: string) {
+  const user = await prisma.user.upsert({ where: { lineUserId: userId }, update: {}, create: { lineUserId: userId } })
+  const log = await prisma.mealLog.findUnique({ where: { id: logId } })
+
+  const { canDeleteMealLog } = await import('@/lib/meal/authorizeMealLog')
+  if (!log || !canDeleteMealLog(user.id, log)) {
+    await replyMessage(replyToken, { type: 'text', text: 'ไม่มีสิทธิ์ลบรายการนี้' })
+    return
+  }
+
+  await prisma.mealLog.delete({ where: { id: logId } })
+  await replyMessage(replyToken, { type: 'text', text: `✅ ลบ "${log.foodName}" แล้ว` })
+}
+
+async function handleHistoryDate(userId: string, replyToken: string, dateStr: string) {
+  const user = await prisma.user.upsert({ where: { lineUserId: userId }, update: {}, create: { lineUserId: userId } })
+  const [day, month] = dateStr.split('/').map(Number)
+  const year = new Date().getFullYear()
+  const start = new Date(year, month - 1, day, 0, 0, 0)
+  const end = new Date(year, month - 1, day, 23, 59, 59)
+
+  const [logs, goal] = await Promise.all([
+    prisma.mealLog.findMany({ where: { userId: user.id, loggedAt: { gte: start, lte: end } } }),
+    prisma.nutritionGoal.findUnique({ where: { userId: user.id } }),
+  ])
+
+  if (!goal) {
+    await replyMessage(replyToken, { type: 'text', text: 'ยังไม่ได้ตั้งค่าเป้าหมายสารอาหาร' })
+    return
+  }
+
+  const { summarizeDay } = await import('@/lib/summary/summarizeDay')
+  const summary = summarizeDay(logs, goal)
+  const { calories: cal, protein: pro, carbs, fat } = summary
+  const text = `📊 สรุปวันที่ ${dateStr}\n\n🔥 แคลอรี่: ${cal.actual} / ${cal.goal} kcal\n🥩 โปรตีน: ${pro.actual} / ${pro.goal} g\n🍚 คาร์บ: ${carbs.actual} / ${carbs.goal} g\n🫒 ไขมัน: ${fat.actual} / ${fat.goal} g`
+  await replyMessage(replyToken, { type: 'text', text })
+}
+
+async function handleProfileEditMenu(replyToken: string) {
+  await replyMessage(replyToken, {
+    type: 'text',
+    text: 'ต้องการแก้ไขอะไร?',
+    quickReply: {
+      items: [
+        { type: 'action', action: { type: 'message', label: 'น้ำหนัก', text: 'edit:weight:?' } },
+        { type: 'action', action: { type: 'message', label: 'ระดับกิจกรรม', text: 'edit:activity:?' } },
+        { type: 'action', action: { type: 'message', label: 'เป้าหมาย', text: 'edit:goal:?' } },
+      ],
+    },
+  })
+}
+
+async function handleProfileUpdate(userId: string, replyToken: string, field: string, value: string) {
+  const user = await prisma.user.upsert({ where: { lineUserId: userId }, update: {}, create: { lineUserId: userId } })
+  const existing = await prisma.profile.findUnique({ where: { userId: user.id } })
+  if (!existing) {
+    await replyMessage(replyToken, { type: 'text', text: 'กรุณาตั้งค่าโปรไฟล์ก่อนด้วยการพิมพ์ "เริ่มต้น"' })
+    return
+  }
+
+  const update: Record<string, string | number> = {}
+  if (field === 'weight') update.weightKg = parseFloat(value)
+  else if (field === 'activity') update.activityLevel = value
+  else if (field === 'goal') update.goalType = value
+
+  const profile = await prisma.profile.upsert({
+    where: { userId: user.id },
+    update,
+    create: { userId: user.id, gender: existing.gender, age: existing.age, weightKg: existing.weightKg, heightCm: existing.heightCm, activityLevel: existing.activityLevel, goalType: existing.goalType, ...update },
+  })
+
+  const calories = calculateTDEE({
+    gender: profile.gender as Gender, age: profile.age, weightKg: profile.weightKg,
+    heightCm: profile.heightCm, activityLevel: profile.activityLevel as ActivityLevel, goalType: profile.goalType as GoalType,
+  })
+  const goal = calculateNutritionGoal({ calories, weightKg: profile.weightKg })
+  await prisma.nutritionGoal.upsert({ where: { userId: user.id }, update: goal, create: { userId: user.id, ...goal } })
+
+  const msg = `✅ อัพเดตแล้ว!\n\n🎯 TDEE ใหม่: ${Math.round(calories)} kcal/วัน\n• โปรตีน: ${goal.protein}g\n• คาร์บ: ${goal.carbs}g\n• ไขมัน: ${goal.fat}g`
+  await replyMessage(replyToken, { type: 'text', text: msg })
+}
+
 async function handleImageMessage(messageId: string, replyToken: string) {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? ''
   const res = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
@@ -220,6 +321,18 @@ export async function POST(req: NextRequest) {
         await replyMessage(event.replyToken, { type: 'text', text: 'ยกเลิกแล้ว 👍 ส่งรูปอาหารหรือพิมพ์ชื่ออาหารใหม่ได้เลย' })
       } else if (text === 'สรุป') {
         await handleDailySummary(event.source.userId, event.replyToken)
+      } else if (text === 'ลบ') {
+        await handleDeleteList(event.source.userId, event.replyToken)
+      } else if (text.startsWith('delete:')) {
+        const logId = text.slice(7)
+        await handleDeleteConfirm(event.source.userId, event.replyToken, logId)
+      } else if (/^\d{1,2}\/\d{2}$/.test(text)) {
+        await handleHistoryDate(event.source.userId, event.replyToken, text)
+      } else if (text === 'แก้ไขโปรไฟล์') {
+        await handleProfileEditMenu(event.replyToken)
+      } else if (text.startsWith('edit:')) {
+        const [, field, value] = text.split(':')
+        await handleProfileUpdate(event.source.userId, event.replyToken, field, value)
       } else {
         await handleOnboarding(event.source.userId, event.replyToken, text)
       }

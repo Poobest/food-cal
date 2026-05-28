@@ -7,9 +7,71 @@ datasource db {
 }
 
 model User {
-  id          String   @id @default(cuid())
-  lineUserId  String   @unique
-  createdAt   DateTime @default(now())
+  id              String           @id @default(cuid())
+  lineUserId      String           @unique
+  createdAt       DateTime         @default(now())
+  profile         Profile?
+  nutritionGoal   NutritionGoal?
+  onboardingState OnboardingState?
+  mealLogs        MealLog[]
 
   @@map("users")
+}
+
+model Profile {
+  id            String  @id @default(cuid())
+  userId        String  @unique
+  user          User    @relation(fields: [userId], references: [id])
+  gender        String
+  age           Int
+  weightKg      Float
+  heightCm      Float
+  activityLevel String
+  goalType      String
+
+  @@map("profiles")
+}
+
+model NutritionGoal {
+  id           String @id @default(cuid())
+  userId       String @unique
+  user         User   @relation(fields: [userId], references: [id])
+  calories     Float
+  protein      Float
+  carbs        Float
+  fiber        Float
+  sugar        Float
+  fat          Float
+  saturatedFat Float
+  sodium       Float
+
+  @@map("nutrition_goals")
+}
+
+model OnboardingState {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+  step   String
+
+  @@map("onboarding_states")
+}
+
+model MealLog {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  foodName  String
+  quantityG Float
+  calories  Float
+  protein   Float
+  carbs     Float
+  fiber     Float
+  sugar     Float
+  fat       Float
+  saturatedFat Float
+  sodium    Float
+  loggedAt  DateTime @default(now())
+
+  @@map("meal_logs")
 }

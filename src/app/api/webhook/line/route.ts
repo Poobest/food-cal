@@ -1,6 +1,91 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { verifySignature } from '@/lib/line/signature'
+import { replyMessage } from '@/lib/line/reply'
 import { prisma } from '@/lib/db/prisma'
+import { calculateTDEE } from '@/lib/tdee/calculateTDEE'
+import { calculateNutritionGoal } from '@/lib/tdee/calculateNutritionGoal'
+import type { ActivityLevel, Gender, GoalType } from '@/lib/tdee/calculateTDEE'
+
+const ONBOARDING_STEPS = ['gender', 'age', 'weight', 'height', 'activity', 'goal'] as const
+type OnboardingStep = (typeof ONBOARDING_STEPS)[number]
+
+const STEP_QUESTIONS: Record<OnboardingStep, object> = {
+  gender: { type: 'text', text: 'สวัสดี! เริ่มต้นด้วยการตั้งค่าโปรไฟล์ 😊\nคุณเป็น เพศ อะไร?', quickReply: { items: [{ type: 'action', action: { type: 'message', label: 'ชาย', text: 'ชาย' } }, { type: 'action', action: { type: 'message', label: 'หญิง', text: 'หญิง' } }] } },
+  age: { type: 'text', text: 'อายุ ของคุณกี่ปี? (เช่น 25)' },
+  weight: { type: 'text', text: 'น้ำหนัก ของคุณกี่กิโลกรัม? (เช่น 65)' },
+  height: { type: 'text', text: 'ส่วนสูง ของคุณกี่เซนติเมตร? (เช่น 170)' },
+  activity: { type: 'text', text: 'ระดับกิจกรรม ของคุณเป็นอย่างไร?', quickReply: { items: [{ type: 'action', action: { type: 'message', label: 'นั่งทำงาน', text: 'sedentary' } }, { type: 'action', action: { type: 'message', label: 'ออกกำลังเบา', text: 'light' } }, { type: 'action', action: { type: 'message', label: 'ออกกำลังปานกลาง', text: 'moderate' } }, { type: 'action', action: { type: 'message', label: 'ออกกำลังหนัก', text: 'active' } }, { type: 'action', action: { type: 'message', label: 'ออกกำลังหนักมาก', text: 'very_active' } }] } },
+  goal: { type: 'text', text: 'เป้าหมาย ของคุณคืออะไร?', quickReply: { items: [{ type: 'action', action: { type: 'message', label: 'ลดน้ำหนัก', text: 'ลดน้ำหนัก' } }, { type: 'action', action: { type: 'message', label: 'รักษาน้ำหนัก', text: 'รักษาน้ำหนัก' } }, { type: 'action', action: { type: 'message', label: 'เพิ่มน้ำหนัก', text: 'เพิ่มน้ำหนัก' } }] } },
+}
+
+const GENDER_MAP: Record<string, Gender> = { ชาย: 'male', หญิง: 'female' }
+const GOAL_MAP: Record<string, GoalType> = { ลดน้ำหนัก: 'lose', รักษาน้ำหนัก: 'maintain', เพิ่มน้ำหนัก: 'gain' }
+
+async function handleOnboarding(userId: string, replyToken: string, text: string) {
+  const user = await prisma.user.upsert({
+    where: { lineUserId: userId },
+    update: {},
+    create: { lineUserId: userId },
+  })
+
+  const state = await prisma.onboardingState.findUnique({ where: { userId: user.id } })
+  const currentStep = (state?.step ?? 'gender') as OnboardingStep
+
+  const partialProfile: Record<string, string | number> = {}
+
+  if (currentStep === 'gender') {
+    partialProfile.gender = GENDER_MAP[text] ?? 'male'
+  } else if (currentStep === 'age') {
+    partialProfile.age = parseInt(text)
+  } else if (currentStep === 'weight') {
+    partialProfile.weightKg = parseFloat(text)
+  } else if (currentStep === 'height') {
+    partialProfile.heightCm = parseFloat(text)
+  } else if (currentStep === 'activity') {
+    partialProfile.activityLevel = text as ActivityLevel
+  } else if (currentStep === 'goal') {
+    const goalType = GOAL_MAP[text] ?? 'maintain'
+    const profile = await prisma.profile.upsert({
+      where: { userId: user.id },
+      update: { goalType },
+      create: { userId: user.id, gender: 'male', age: 25, weightKg: 60, heightCm: 165, activityLevel: 'sedentary', goalType },
+    })
+    const calories = calculateTDEE({
+      gender: profile.gender as Gender,
+      age: profile.age,
+      weightKg: profile.weightKg,
+      heightCm: profile.heightCm,
+      activityLevel: profile.activityLevel as ActivityLevel,
+      goalType: profile.goalType as GoalType,
+    })
+    const goal = calculateNutritionGoal({ calories, weightKg: profile.weightKg })
+    await prisma.nutritionGoal.upsert({
+      where: { userId: user.id },
+      update: goal,
+      create: { userId: user.id, ...goal },
+    })
+    const msg = `🎯 TDEE ของคุณคือ ${Math.round(calories)} kcal/วัน\n\nเป้าหมายสารอาหารต่อวัน:\n• โปรตีน: ${goal.protein}g\n• คาร์บ: ${goal.carbs}g\n• ไขมัน: ${goal.fat}g\n\nพร้อมแล้ว! ส่งรูปอาหารหรือพิมพ์ชื่ออาหารเพื่อบันทึกมื้อ 🍽️`
+    await replyMessage(replyToken, { type: 'text', text: msg })
+    return
+  }
+
+  if (Object.keys(partialProfile).length > 0) {
+    await prisma.profile.upsert({
+      where: { userId: user.id },
+      update: partialProfile,
+      create: { userId: user.id, gender: 'male', age: 25, weightKg: 60, heightCm: 165, activityLevel: 'sedentary', goalType: 'maintain', ...partialProfile },
+    })
+  }
+
+  const nextIdx = ONBOARDING_STEPS.indexOf(currentStep) + 1
+  const nextStep = ONBOARDING_STEPS[nextIdx] ?? 'goal'
+  await prisma.onboardingState.upsert({
+    where: { userId: user.id },
+    update: { step: nextStep },
+    create: { userId: user.id, step: nextStep },
+  })
+  await replyMessage(replyToken, STEP_QUESTIONS[nextStep])
+}
 
 export async function POST(req: NextRequest) {
   const body = await req.text()
@@ -20,6 +105,9 @@ export async function POST(req: NextRequest) {
         update: {},
         create: { lineUserId: event.source.userId },
       })
+      await replyMessage(event.replyToken, STEP_QUESTIONS.gender)
+    } else if (event.type === 'message' && event.message.type === 'text') {
+      await handleOnboarding(event.source.userId, event.replyToken, event.message.text)
     }
   }
 

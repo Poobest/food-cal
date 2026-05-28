@@ -4,6 +4,8 @@ import { replyMessage } from '@/lib/line/reply'
 import { prisma } from '@/lib/db/prisma'
 import { calculateTDEE } from '@/lib/tdee/calculateTDEE'
 import { calculateNutritionGoal } from '@/lib/tdee/calculateNutritionGoal'
+import { recognizeFoodFromImage } from '@/lib/ai/recognizeFood'
+import { searchFood } from '@/lib/usda/searchFood'
 import type { ActivityLevel, Gender, GoalType } from '@/lib/tdee/calculateTDEE'
 
 const ONBOARDING_STEPS = ['gender', 'age', 'weight', 'height', 'activity', 'goal'] as const
@@ -87,6 +89,41 @@ async function handleOnboarding(userId: string, replyToken: string, text: string
   await replyMessage(replyToken, STEP_QUESTIONS[nextStep])
 }
 
+async function handleImageMessage(messageId: string, replyToken: string) {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? ''
+  const res = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const buffer = Buffer.from(await res.arrayBuffer())
+
+  const foodName = await recognizeFoodFromImage(buffer)
+  if (!foodName) {
+    await replyMessage(replyToken, { type: 'text', text: 'ไม่สามารถระบุอาหารจากรูปนี้ได้ ลองส่งรูปอื่นหรือพิมพ์ชื่ออาหารแทนได้เลย 😊' })
+    return
+  }
+
+  const food = await searchFood(foodName)
+  if (!food) {
+    await replyMessage(replyToken, { type: 'text', text: `ไม่พบข้อมูลโภชนาการของ "${foodName}" ในฐานข้อมูล ลองพิมพ์ชื่ออาหารอีกครั้ง` })
+    return
+  }
+
+  const { nutrients } = food
+  const text = `🍽️ ${food.name}\n\nสารอาหารต่อ 100g:\n• แคลอรี่: ${nutrients.calories} kcal\n• โปรตีน: ${nutrients.protein}g\n• คาร์บ: ${nutrients.carbs}g\n• ไขมัน: ${nutrients.fat}g\n• โซเดียม: ${nutrients.sodium}mg\n\nต้องการบันทึกมื้อนี้ไหม?`
+  await replyMessage(replyToken, {
+    type: 'text',
+    text,
+    quickReply: {
+      items: [
+        { type: 'action', action: { type: 'message', label: '100g', text: `log:${food.name}:100` } },
+        { type: 'action', action: { type: 'message', label: '150g', text: `log:${food.name}:150` } },
+        { type: 'action', action: { type: 'message', label: '200g', text: `log:${food.name}:200` } },
+        { type: 'action', action: { type: 'message', label: 'ยกเลิก', text: 'ยกเลิก' } },
+      ],
+    },
+  })
+}
+
 export async function POST(req: NextRequest) {
   const body = await req.text()
   const signature = req.headers.get('x-line-signature') ?? ''
@@ -106,6 +143,8 @@ export async function POST(req: NextRequest) {
         create: { lineUserId: event.source.userId },
       })
       await replyMessage(event.replyToken, STEP_QUESTIONS.gender)
+    } else if (event.type === 'message' && event.message.type === 'image') {
+      await handleImageMessage(event.message.id, event.replyToken)
     } else if (event.type === 'message' && event.message.type === 'text') {
       await handleOnboarding(event.source.userId, event.replyToken, event.message.text)
     }

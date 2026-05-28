@@ -6,6 +6,7 @@ import { calculateTDEE } from '@/lib/tdee/calculateTDEE'
 import { calculateNutritionGoal } from '@/lib/tdee/calculateNutritionGoal'
 import { recognizeFoodFromImage } from '@/lib/ai/recognizeFood'
 import { searchFood } from '@/lib/usda/searchFood'
+import { summarizeDay } from '@/lib/summary/summarizeDay'
 import type { ActivityLevel, Gender, GoalType } from '@/lib/tdee/calculateTDEE'
 
 const ONBOARDING_STEPS = ['gender', 'age', 'weight', 'height', 'activity', 'goal'] as const
@@ -118,6 +119,42 @@ async function handleMealLog(userId: string, replyToken: string, foodName: strin
   await replyMessage(replyToken, { type: 'text', text })
 }
 
+async function handleDailySummary(userId: string, replyToken: string) {
+  const user = await prisma.user.upsert({
+    where: { lineUserId: userId },
+    update: {},
+    create: { lineUserId: userId },
+  })
+
+  const goal = await prisma.nutritionGoal.findUnique({ where: { userId: user.id } })
+  if (!goal) {
+    await replyMessage(replyToken, { type: 'text', text: 'ยังไม่ได้ตั้งค่าเป้าหมายสารอาหาร พิมพ์ "เริ่มต้น" เพื่อตั้งค่าโปรไฟล์ก่อนนะคะ 😊' })
+    return
+  }
+
+  const startOfDay = new Date()
+  startOfDay.setHours(0, 0, 0, 0)
+
+  const logs = await prisma.mealLog.findMany({
+    where: { userId: user.id, loggedAt: { gte: startOfDay } },
+  })
+
+  const summary = summarizeDay(logs, goal)
+  const { calories: cal, protein: pro, carbs, fat, sodium } = summary
+
+  const text = [
+    '📊 สรุปสารอาหารวันนี้',
+    '',
+    `🔥 แคลอรี่:   ${cal.actual} / ${cal.goal} kcal (เหลือ ${cal.remaining})`,
+    `🥩 โปรตีน:   ${pro.actual} / ${pro.goal} g`,
+    `🍚 คาร์บ:     ${carbs.actual} / ${carbs.goal} g`,
+    `🫒 ไขมัน:    ${fat.actual} / ${fat.goal} g`,
+    `🧂 โซเดียม:  ${sodium.actual} / ${sodium.goal} mg`,
+  ].join('\n')
+
+  await replyMessage(replyToken, { type: 'text', text })
+}
+
 async function handleImageMessage(messageId: string, replyToken: string) {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? ''
   const res = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
@@ -181,6 +218,8 @@ export async function POST(req: NextRequest) {
         await handleMealLog(event.source.userId, event.replyToken, foodName, parseInt(qty))
       } else if (text === 'ยกเลิก') {
         await replyMessage(event.replyToken, { type: 'text', text: 'ยกเลิกแล้ว 👍 ส่งรูปอาหารหรือพิมพ์ชื่ออาหารใหม่ได้เลย' })
+      } else if (text === 'สรุป') {
+        await handleDailySummary(event.source.userId, event.replyToken)
       } else {
         await handleOnboarding(event.source.userId, event.replyToken, text)
       }
